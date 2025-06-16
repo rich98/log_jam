@@ -1,0 +1,1 @@
+powershell -ExecutionPolicy Bypass -File "C:\working\log_jam02.ps1"

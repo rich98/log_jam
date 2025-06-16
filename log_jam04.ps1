@@ -1,16 +1,32 @@
-# ---------------- Configuration ----------------
-$SyslogServer   = "192.168.0.70"      # Syslog server IP or hostname
-$SyslogPort     = 514                  # UDP port (typically 514 for syslog)
-$LogName        = "Security"           # Windows Event Log to monitor
-$Facility       = 4                    # Syslog facility (4 = security/auth)
-$PollInterval   = 30                    # Poll interval in seconds
-$MaxEvents      = 50                   # Max events to fetch per poll
-$MaxQueueSize   = 1000                 # Max queued unsent messages
+# ---------------- Parameters ----------------
+param (
+    [string]$SyslogServer = "192.168.0.70",  # Syslog server IP or hostname
+    [int]$SyslogPort = 514,                  # UDP port (typically 514 for syslog)
+    [string]$LogName = "Security",           # Windows Event Log to monitor
+    [int]$Facility = 4,                      # Syslog facility (4 = security/auth)
+    [int]$PollInterval = 30,                 # Poll interval in seconds
+    [int]$MaxEvents = 50,                    # Max events to fetch per poll
+    [int]$MaxQueueSize = 1000,               # Max queued unsent messages
+    [string]$LocalLogPath = "C:\Logs\SyslogFallback.log"  # Optional local log fallback
+)
+
+# ---------------- Ensure Local Log Directory Exists ----------------
+$logDir = Split-Path $LocalLogPath -Parent
+if (-not (Test-Path $logDir)) {
+    New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+}
 
 # ---------------- Privilege Check ----------------
 if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     Write-Warning "This script must be run as Administrator to access the Security log."
     exit
+}
+
+# ---------------- Event Handler for Cleanup ----------------
+$udpClient = New-Object System.Net.Sockets.UdpClient
+Register-EngineEvent PowerShell.Exiting -Action {
+    $udpClient.Close()
+    Write-Host "Syslog monitoring ended." -ForegroundColor Green
 }
 
 # ------------- Syslog Severity Mapping -------------
@@ -37,8 +53,9 @@ function Format-SyslogMessage {
     $sanitizedMessage = ($LogEvent.Message -replace '[\r\n]+', ' ') -replace '[^\x20-\x7E]', ''
 
     $message = "<$priority>$timestamp $hostname ${LogName}: EventID=$($LogEvent.EventID); Source=$($LogEvent.Source); $sanitizedMessage"
-    if ($message.Length -gt 1024) {
-        $message = $message.Substring(0, 1020) + "..."
+
+    while ([System.Text.Encoding]::ASCII.GetByteCount($message) -gt 1024) {
+        $message = $message.Substring(0, $message.Length - 5) + "..."
     }
 
     return $message
@@ -52,6 +69,10 @@ function Try-SendSyslogMessage {
     )
     try {
         $bytes = [System.Text.Encoding]::ASCII.GetBytes($Message)
+        if ($bytes.Length -eq 0) {
+            Write-Warning "Message encoding failed or empty. Message skipped."
+            return $false
+        }
         $udpClient.Send($bytes, $bytes.Length, $SyslogServer, $SyslogPort) | Out-Null
         return $true
     } catch {
@@ -60,8 +81,7 @@ function Try-SendSyslogMessage {
     }
 }
 
-# -------------- Initialize UDP Client and Queue --------------
-$udpClient = New-Object System.Net.Sockets.UdpClient
+# -------------- Initialize Queue --------------
 $eventQueue = New-Object System.Collections.Queue
 Write-Host "Monitoring '${LogName}' log. Polling every $PollInterval seconds..." -ForegroundColor Cyan
 
@@ -84,10 +104,9 @@ while ($true) {
             $queuedMessage = $eventQueue.Dequeue()
             if (-not (Try-SendSyslogMessage -Message $queuedMessage -udpClient $udpClient)) {
                 $tempQueue += $queuedMessage
-                break  # Avoid flooding network if still failing
+                break
             }
         }
-
         foreach ($msg in $tempQueue) {
             $eventQueue.Enqueue($msg)
         }
@@ -116,8 +135,9 @@ while ($true) {
 
             if (-not (Try-SendSyslogMessage -Message $syslogMessage -udpClient $udpClient)) {
                 $eventQueue.Enqueue($syslogMessage)
+                Add-Content -Path $LocalLogPath -Value $syslogMessage
                 if ($eventQueue.Count -gt $MaxQueueSize) {
-                    $eventQueue.Dequeue()  # Drop oldest
+                    $eventQueue.Dequeue()
                     Write-Warning "Event queue exceeded limit. Dropping oldest message."
                 }
             }
@@ -131,9 +151,6 @@ while ($true) {
     Start-Sleep -Seconds $PollInterval
 }
 
-# ------------------ Cleanup ---------------------
-$udpClient.Close()
-Write-Host "Syslog monitoring ended." -ForegroundColor Green
 
 
 
